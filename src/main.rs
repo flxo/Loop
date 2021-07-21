@@ -1,254 +1,273 @@
-extern crate structopt;
-extern crate humantime;
-extern crate atty;
-extern crate regex;
-extern crate subprocess;
-extern crate tempfile;
-
-use std::env;
-use std::f64;
-use std::io::prelude::*;
-use std::io::{self, BufRead, SeekFrom};
-use std::process;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
-
+use anyhow::{Context, Result};
+use futures::{
+    future::{self, Either},
+    stream::{self, StreamExt},
+};
 use humantime::{parse_duration, parse_rfc3339_weak};
 use regex::Regex;
-use subprocess::{Exec, ExitStatus, Redirection};
+use std::{
+    process::Stdio,
+    time::{Duration, SystemTime},
+};
 use structopt::StructOpt;
+use tokio::{pin, process, select, time};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
-static UNKONWN_EXIT_CODE: u32 = 99;
-
-// same exit code as use of `timeout` shell command
+// Same exit code as use of `timeout` shell command
 static TIMEOUT_EXIT_CODE: i32 = 124;
 
-fn main() {
+#[cfg(unix)]
+const SHELL: [&str; 2] = ["sh", "-c"];
+#[cfg(windows)]
+const SHELL: [&str; 2] = ["cmd.exe", "/c"];
 
-    // Load the CLI arguments
-    let opt = Opt::from_args();
-    let count_precision = Opt::clap()
-        .get_matches()
-        .value_of("count_by")
-        .map(precision_of)
-        .unwrap_or(0);
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let mut opt = Opt::from_args();
 
-    let mut exit_status = 0;
-
-    // Time
-    let program_start = Instant::now();
-
-    // Number of iterations
-    let mut items = if let Some(items) = opt.ffor { items.clone() } else { vec![] };
-
-    // Get any lines from stdin
-    if opt.stdin || atty::isnt(atty::Stream::Stdin) {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            items.push(line.unwrap().to_owned())
-        }
+    if opt.input.is_empty() {
+        eprintln!("Missing command");
+        std::process::exit(1);
     }
 
-    let joined_input = &opt.input.join(" ");
-    if joined_input == "" {
-        println!("No command supplied, exiting.");
-        return;
-    }
+    // Until duration of systemtime
+    let for_duration = opt
+        .for_duration
+        .map(time::sleep)
+        .map(Either::Left)
+        .unwrap_or_else(|| Either::Right(future::pending::<()>()));
+    pin!(for_duration);
+    let until_time = opt
+        .until_time
+        .map(|r| r.duration_since(SystemTime::now()).expect("Invalid time"))
+        .map(time::sleep)
+        .map(Either::Left)
+        .unwrap_or_else(|| Either::Right(future::pending::<()>()));
+    pin!(until_time);
+    let mut until = future::select(for_duration, until_time);
 
-    // Counters and State
-    let num = if let Some(num) = opt.num {
-        num
-    } else if !items.is_empty() {
-        items.len() as f64
+    let mut summary = opt.summary.then(Summary::default);
+
+    // Counter in env variable LOOP_COUNT
+    let mut iteration = 0u64;
+
+    // opt.stdin and opt.ffor
+    let mut items = if opt.stdin {
+        let stdin = tokio::io::stdin();
+        let lines = FramedRead::new(stdin, LinesCodec::new());
+        let lines = lines.filter_map(|l| future::ready(l.ok()));
+        Some(Either::Left(lines))
+    } else if let Some(ffor) = opt.ffor.as_ref() {
+        let iter = ffor.split(',').map(ToString::to_string);
+        Some(Either::Right(stream::iter(iter)))
     } else {
-        f64::INFINITY
+        None
     };
-    let mut has_matched = false;
-    let mut tmpfile = tempfile::tempfile().unwrap();
-    let mut summary = Summary { successes: 0, failures: Vec::new() };
-    let mut previous_stdout = None;
 
-    let counter = Counter {
-            start: opt.offset - opt.count_by,
-            iters: 0.0,
-            end: num,
-            step_by: opt.count_by
-    };
-    for (count, actual_count) in counter.enumerate() {
+    // opt.only_last
+    let mut output = opt.only_last.then(Vec::new);
 
-        // Time Start
-        let loop_start = Instant::now();
+    // Cach last lines of stdout and stderr if needed
+    let mut last_stdout = None;
+    let mut last_stderr = None;
 
-        // Set counters before execution
-        // THESE ARE FLIPPED AND I CAN'T UNFLIP THEM.
-        env::set_var("ACTUALCOUNT", count.to_string());
-        env::set_var("COUNT", format!("{:.*}", count_precision, actual_count));
+    let exit = 'outer: loop {
+        let mut command = process::Command::new(SHELL[0]);
+        command.arg(SHELL[1]);
+        command.arg(&opt.input.join(" "));
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
-        // Set iterated item as environment variable
-        if let Some(item) = items.get(count) {
-            env::set_var("ITEM", item);
-        }
+        // opt.count_by
+        let count = opt.offset.unwrap_or_default() + iteration as f64 * opt.count_by;
+        command.env("COUNT", count.to_string());
+        command.env("ACTUALCOUNT", iteration.to_string());
 
-        // Finish if we're over our duration
-        if let Some(duration) = opt.for_duration {
-            let since = Instant::now().duration_since(program_start);
-            if since >= duration {
-                if opt.error_duration {
-                    exit_status = TIMEOUT_EXIT_CODE
-                }
-                break;
+        // ffor and stdint
+        if let Some(items) = items.as_mut() {
+            if let Some(f) = items.next().await {
+                command.env("ITEM", f);
+            } else {
+                // Last item already used - exit...
+                break 0;
             }
         }
 
-        // Finish if our time until has passed
-        // In this location, the loop will execute at least once,
-        // even if the start time is beyond the until time.
-        if let Some(until_time) = opt.until_time {
-            if SystemTime::now().duration_since(until_time).is_ok() {
-                break;
+        // spawn
+        let mut child = command.spawn()?;
+        let mut output_closed = false;
+        let mut running = true;
+        let mut done = false;
+
+        // opt.num
+        if let Some(n) = opt.num.as_mut() {
+            if *n == 0 {
+                break 0;
+            } else {
+                *n -= 1;
             }
         }
 
-        // Main executor
-        tmpfile.seek(SeekFrom::Start(0)).expect("seek failed");
-        tmpfile.set_len(0).expect("truncate failed");
-        let result = Exec::shell(joined_input)
-            .stdout(Redirection::File(tmpfile.try_clone().unwrap()))
-            .stderr(Redirection::Merge)
-            .capture().unwrap();
-
-        // Print the results
-        let mut stdout = String::new();
-        tmpfile.seek(SeekFrom::Start(0)).expect("seek failed");
-        tmpfile.read_to_string(&mut stdout).expect("read failed");
-        for line in stdout.lines() {
-            // --only-last
-            // If we only want output from the last execution,
-            // defer printing until later
-            if !opt.only_last {
-                println!("{}", line);
-            }
-
-            // --until-contains
-            // We defer loop breaking until the entire result is printed.
-            if let Some(string) = &opt.until_contains {
-                if line.contains(string){
-                    has_matched = true;
-                }
-            }
-
-            // --until-match
-            if let Some(regex) = &opt.until_match {
-                if regex.captures(&line).is_some() {
-                    has_matched = true;
-                }
-            }
+        // opt.only_last
+        if let Some(l) = output.as_mut() {
+            l.clear()
         }
 
-        // --until-error
-        if let Some(error_code) = &opt.until_error {
-            match error_code {
-                ErrorCode::Any => if !result.exit_status.success() {
-                    has_matched = true;
-                },
-                ErrorCode::Code(code) =>  {
-                    if result.exit_status == ExitStatus::Exited(*code) {
-                        has_matched = true;
+        // output streams
+        let stdout = child.stdout.take().context("failed to get stdout")?;
+        let stdout = FramedRead::new(stdout, LinesCodec::new()).map(Line::Stdout);
+
+        let stderr = child.stderr.take().expect("failed to get stderr");
+        let stderr = FramedRead::new(stderr, LinesCodec::new()).map(Line::Stderr);
+
+        // Stream containing stdout and stderr
+        let mut stdout_err = stream::select(stdout, stderr);
+
+        // Need to store the last stdout and stderr line
+        let need_last = opt.until_same || opt.until_changes;
+
+        'inner: loop {
+            select! {
+                _ = &mut until => {
+                    child.kill().await.context("failed to terminate child process")?;
+                    if opt.error_duration {
+                        break 'outer TIMEOUT_EXIT_CODE;
+                    } else {
+                        break 'outer 0;
                     }
                 }
-            }
-        }
+                stdout_err = stdout_err.next() => {
+                    let (stdout_err, do_break) = match stdout_err {
+                        Some(output) => match output {
+                            Line::Stdout(Ok(ref l)) => {
+                                let last = need_last.then(|| last_stdout.replace(l.to_string())).flatten();
+                                let do_break = check_line(&opt, &l, last.as_ref());
+                                (output, do_break)
+                            },
+                            Line::Stderr(Ok(ref l)) => {
+                                let last = need_last.then(|| last_stderr.replace(l.to_string())).flatten();
+                                let do_break = check_line(&opt, &l, last.as_ref());
+                                (output, do_break)
+                            }
+                            Line::Stdout(e) | Line::Stderr(e) => return e.map(drop).context("io error"),
+                        }
+                        None => {
+                            output_closed = true;
+                            // Just break if the child already exited. Otherwise set the flag
+                            // and the waitpid will do the rest.
+                            if !running {
+                                break 'inner;
+                            } else {
+                                continue 'inner;
+                            }
+                        }
+                    };
 
-        // --until-success
-        if opt.until_success && result.exit_status.success() {
-                has_matched = true;
-        }
 
-        // --until-fail
-        if opt.until_fail && !(result.exit_status.success()) {
-                has_matched = true;
-        }
+                    // Print it
+                    if let Some(output) = output.as_mut() {
+                        output.push(stdout_err);
+                    } else {
+                        stdout_err.println();
+                    }
 
-        if opt.summary {
-            match result.exit_status {
-                ExitStatus::Exited(0)  =>  summary.successes += 1,
-                ExitStatus::Exited(n) => summary.failures.push(n),
-                _ => summary.failures.push(UNKONWN_EXIT_CODE),
-            }
-        }
-
-        // Finish if we matched
-        if has_matched {
-            break;
-        }
-
-        if let Some(ref previous_stdout) = previous_stdout {
-            // --until-changes
-            if opt.until_changes {
-                if *previous_stdout != stdout {
-                    break;
+                    if do_break {
+                        break 'outer 0;
+                    }
                 }
-            }
 
-            // --until-same
-            if opt.until_same {
-                if *previous_stdout == stdout {
-                    break;
+                exit = child.wait(), if running => {
+                    running = false;
+
+                    let exit_status = exit.context("failed to get process exist status")?;
+                    let exit_code = exit_status.code().context("failed to get exit code")?;
+
+                    // update summary
+                    if let Some(ref mut summary) = summary {
+                        if exit_status.success() {
+                            summary.successes += 1;
+                        } else {
+                            summary.failures.push(exit_code);
+                        }
+                    }
+
+                    // opt.until_failed
+                    if opt.until_fail && !exit_status.success() {
+                        done = true;
+                    }
+
+                    // opt.until_sucess
+                    if opt.until_success && exit_status.success() {
+                        done = true;
+                    }
+
+                    // opt.until_error
+                    if opt.until_code == Some(exit_code) {
+                        done = true;
+                    }
+
+                    // Break the inner loop if the reading stdout and stderr is complete
+                    if output_closed {
+                        break 'inner;
+                    }
                 }
+                else => (),
             }
-        } else {
-            previous_stdout = Some(stdout);
         }
 
-        // Delay until next iteration time
-        let since = Instant::now().duration_since(loop_start);
-        if let Some(time) = opt.every.checked_sub(since) {
-            thread::sleep(time);
+        iteration += 1;
+
+        if done {
+            break 'outer 0;
+        }
+
+        if let Some(every) = opt.every {
+            time::sleep(every).await;
+        }
+    };
+
+    if let Some(lines) = output {
+        for line in lines {
+            line.println();
         }
     }
 
-    if opt.only_last {
-        let mut stdout = String::new();
-        tmpfile.seek(SeekFrom::Start(0)).expect("seek failed");
-        tmpfile.read_to_string(&mut stdout).expect("read failed");
-        for line in stdout.lines() {
-            println!("{}", line);
-        }
+    if let Some(_summary) = summary {
+        Summary::print(_summary)
     }
 
-    if opt.summary {
-        summary.print()
-    }
-    process::exit(exit_status);
+    std::process::exit(exit);
 }
 
 #[derive(StructOpt, Debug)]
-#[structopt(name = "loop", author = "Rich Jones <miserlou@gmail.com>",
-            about = "UNIX's missing `loop` command")]
+#[structopt(
+    name = "loop",
+    author = "Rich Jones <miserlou@gmail.com>",
+    about = "UNIX's missing `loop` command"
+)]
 struct Opt {
     /// Number of iterations to execute
     #[structopt(short = "n", long = "num")]
-    num: Option<f64>,
+    num: Option<u32>,
 
-    /// Amount to increment the counter by
+    /// Amount to increment the counter by. Set $COUNT to the number of interations done
     #[structopt(short = "b", long = "count-by", default_value = "1")]
     count_by: f64,
 
     /// Amount to offset the initial counter by
-    #[structopt(short = "o", long = "offset", default_value = "0")]
-    offset: f64,
+    #[structopt(short = "o", long = "offset")]
+    offset: Option<f64>,
 
     /// How often to iterate. ex., 5s, 1h1m1s1ms1us
-    #[structopt(short = "e", long = "every", default_value = "1us",
-                parse(try_from_str = "parse_duration"))]
-    every: Duration,
+    #[structopt(short = "e", long = "every", parse(try_from_str = parse_duration))]
+    every: Option<Duration>,
 
-    /// A comma-separated list of values, placed into 4ITEM. ex., red,green,blue
-    #[structopt(long = "for", parse(from_str = "get_values"))]
-    ffor: Option<Vec<String>>,
+    /// A comma-separated list of values, placed into $ITEM. ex., red,green,blue
+    #[structopt(long = "for", conflicts_with = "stdin")]
+    ffor: Option<String>,
 
     /// Keep going until the duration has elapsed (example 1m30s)
-    #[structopt(short = "d", long = "for-duration", parse(try_from_str = "parse_duration"))]
+    #[structopt(short = "d", long = "for-duration", parse(try_from_str = parse_duration))]
     for_duration: Option<Duration>,
 
     /// Keep going until the output contains this string
@@ -264,16 +283,16 @@ struct Opt {
     until_same: bool,
 
     /// Keep going until the output matches this regular expression
-    #[structopt(short = "m", long = "until-match", parse(try_from_str = "Regex::new"))]
+    #[structopt(short = "m", long = "until-match", parse(try_from_str = Regex::new))]
     until_match: Option<Regex>,
 
     /// Keep going until a future time, ex. "2018-04-20 04:20:00" (Times in UTC.)
-    #[structopt(short = "t", long = "until-time", parse(try_from_str = "parse_rfc3339_weak"))]
+    #[structopt(short = "t", long = "until-time", parse(try_from_str = parse_rfc3339_weak))]
     until_time: Option<SystemTime>,
 
     /// Keep going until the command exit status is the value given
-    #[structopt(short = "r", long = "until-error", parse(from_str = "get_error_code"))]
-    until_error: Option<ErrorCode>,
+    #[structopt(short = "r", long = "until-code")]
+    until_code: Option<i32>,
 
     /// Keep going until the command exit status is zero
     #[structopt(short = "s", long = "until-success")]
@@ -288,7 +307,7 @@ struct Opt {
     only_last: bool,
 
     /// Read from standard input
-    #[structopt(short = "i", long = "stdin")]
+    #[structopt(short = "i", long = "stdin", conflicts_with = "for")]
     stdin: bool,
 
     /// Exit with timeout error code on duration
@@ -300,89 +319,87 @@ struct Opt {
     summary: bool,
 
     /// The command to be looped
-    #[structopt(raw(multiple="true"))]
-    input: Vec<String>
-
+    input: Vec<String>,
 }
 
-fn precision_of(s: &str) -> usize {
-    let after_point = match s.find('.') {
-        // '.' is ASCII so has len 1
-        Some(point) => point + 1,
-        None => return 0,
-    };
-    let exp = match s.find(&['e', 'E'][..]) {
-        Some(exp) => exp,
-        None => s.len(),
-    };
-    exp - after_point
+/// Check a single line for a aborting condition. Return true if abortion condition is met.
+fn check_line(opt: &Opt, line: &str, last: Option<&String>) -> bool {
+    if let Some(last) = last {
+        if opt.until_changes && (last != line) {
+            return true;
+        }
+
+        if opt.until_same && (last == line) {
+            return true;
+        }
+    }
+
+    if opt
+        .until_match
+        .as_ref()
+        .map(|r| r.is_match(&line))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if opt
+        .until_contains
+        .as_ref()
+        .map(|r| line.contains(r))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    false
 }
 
+/// Output result on stdout or stderr
 #[derive(Debug)]
-enum ErrorCode {
-    Any,
-    Code(u32),
+enum Line {
+    Stdout(Result<String, LinesCodecError>),
+    Stderr(Result<String, LinesCodecError>),
 }
 
-fn get_error_code(input: &str) -> ErrorCode {
-    if let Ok(code) = input.parse::<u32>() {
-        ErrorCode::Code(code)
-    } else {
-        ErrorCode::Any
+impl Line {
+    /// Print this line on stdout or stderr
+    fn println(&self) {
+        match self {
+            Line::Stdout(Ok(l)) => println!("{}", l),
+            Line::Stderr(Ok(l)) => eprintln!("{}", l),
+            _ => (),
+        }
     }
 }
 
-fn get_values(input: &str) -> Vec<String> {
-    if input.contains('\n'){
-        input.split('\n').map(String::from).collect()
-    } else if input.contains(','){
-        input.split(',').map(String::from).collect()
-    } else {
-        input.split(' ').map(String::from).collect()
-    }
-}
-
-struct Counter {
-    start: f64,
-    iters: f64,
-    end: f64,
-    step_by: f64,
-}
-
-#[derive(Debug)]
+/// Summary
+#[derive(Debug, Default)]
 struct Summary {
     successes: u32,
-    failures: Vec<u32>
+    failures: Vec<i32>,
 }
 
 impl Summary {
+    /// print summary
     fn print(self) {
-        let total = self.successes + self.failures.len() as u32;
-
-        let errors = if self.failures.is_empty() {
-            String::from("0")
-        } else {
-            format!("{} ({})", self.failures.len(), self.failures.as_slice().into_iter()
-                    .map(|f| ((*f as u32)).to_string())
-                    .collect::<Vec<String>>()
-                    .join(", "))
-        };
-
-        println!("Total runs:\t{}", total);
+        println!(
+            "Total runs:\t{}",
+            self.successes + self.failures.len() as u32
+        );
         println!("Successes:\t{}", self.successes);
-        println!("Failures:\t{}", errors);
-    }
-}
-
-impl Iterator for Counter {
-    type Item = f64;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.start += self.step_by;
-        self.iters += 1.0;
-        if self.iters <= self.end {
-            Some(self.start)
+        if self.failures.is_empty() {
+            println!("Failures:\t0");
         } else {
-            None
+            println!(
+                "Failures:\t{} ({})",
+                self.failures.len(),
+                self.failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
 }
