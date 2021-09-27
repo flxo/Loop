@@ -97,7 +97,6 @@ async fn main() -> Result<()> {
         let mut child = command.spawn()?;
         let mut output_closed = false;
         let mut running = true;
-        let mut done = false;
 
         // opt.num
         if let Some(n) = opt.num.as_mut() {
@@ -191,19 +190,19 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // opt.until_failed
+                    // opt.until_fail
                     if opt.until_fail && !exit_status.success() {
-                        done = true;
+                        break 'outer exit_code;
                     }
 
                     // opt.until_sucess
                     if opt.until_success && exit_status.success() {
-                        done = true;
+                        break 'outer exit_code;
                     }
 
                     // opt.until_error
                     if opt.until_code == Some(exit_code) {
-                        done = true;
+                        break 'outer exit_code;
                     }
 
                     // Break the inner loop if the reading stdout and stderr is complete
@@ -216,10 +215,6 @@ async fn main() -> Result<()> {
         }
 
         iteration += 1;
-
-        if done {
-            break 'outer 0;
-        }
 
         if let Some(every) = opt.every {
             time::sleep(every).await;
