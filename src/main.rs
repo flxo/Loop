@@ -218,6 +218,9 @@ async fn main() -> Result<()> {
 
         if let Some(every) = opt.every {
             time::sleep(every).await;
+        } else {
+            // Yield to the async runtime to avoid tight loop
+            tokio::task::yield_now().await;
         }
     };
 
