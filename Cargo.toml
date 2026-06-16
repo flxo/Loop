@@ -1,9 +1,9 @@
 [package]
 name = "loop-rs"
-version = "0.6.1"
+version = "0.7.0"
 authors = ["Rich Jones <miserlou@gmail.com>", "Felix Obenhuber <felix@obenhuber.de>"]
 description = "UNIX's missing loop command"
-edition = "2018"
+edition = "2021"
 
 documentation = "https://github.com/Miserlou/Loop"
 homepage = "https://github.com/Miserlou/Loop"
@@ -13,18 +13,17 @@ readme = "README.md"
 license = "MIT"
 
 [dependencies]
-anyhow = "1.0.42"
-atty = "0.2.14"
-bytes = "1.0.1"
-futures = "0.3.15"
-humantime = "2.1.0"
-regex = "1.5.4"
-structopt = "0.3.22"
-tokio = { version = "1.8.2", features = ["rt", "macros", "io-util", "io-std", "time", "process"] }
-tokio-util = { version = "0.6.7", features = ["codec"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+humantime = "2"
+portable-pty = "0.9"
+regex = "1"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [dev-dependencies]
-assert_cmd = "1.0.7"
+assert_cmd = "2"
 
 [[bin]]
 name = "loop"

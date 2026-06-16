@@ -1,36 +1,47 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use futures::{
     future::{self, Either},
     stream::{self, StreamExt},
 };
 use humantime::{parse_duration, parse_rfc3339_weak};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
 use std::{
-    process::Stdio,
+    io::{BufRead, BufReader},
     time::{Duration, SystemTime},
 };
-use structopt::StructOpt;
-use tokio::{pin, process, select, time};
-use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+use tokio::{pin, select, sync::mpsc, task, time};
+use tokio_util::codec::{FramedRead, LinesCodec};
 
-// Same exit code as use of `timeout` shell command
-static TIMEOUT_EXIT_CODE: i32 = 124;
+// Same exit code as the `timeout` shell command.
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 #[cfg(unix)]
 const SHELL: [&str; 2] = ["sh", "-c"];
 #[cfg(windows)]
 const SHELL: [&str; 2] = ["cmd.exe", "/c"];
 
+// Default PTY dimensions when we cannot detect the host terminal size. 80x24
+// matches the historic VT100 default; programs use this for line wrapping but
+// not much else.
+const DEFAULT_PTY_SIZE: PtySize = PtySize {
+    rows: 24,
+    cols: 80,
+    pixel_width: 0,
+    pixel_height: 0,
+};
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let mut opt = Opt::from_args();
+    let mut opt = Opt::parse();
 
     if opt.input.is_empty() {
         eprintln!("Missing command");
         std::process::exit(1);
     }
 
-    // Until duration of systemtime
+    // Overall deadline: --for-duration and/or --until-time, whichever fires first.
     let for_duration = opt
         .for_duration
         .map(time::sleep)
@@ -39,7 +50,11 @@ async fn main() -> Result<()> {
     pin!(for_duration);
     let until_time = opt
         .until_time
-        .map(|r| r.duration_since(SystemTime::now()).expect("Invalid time"))
+        .map(|r| {
+            r.duration_since(SystemTime::now())
+                .context("--until-time is in the past")
+        })
+        .transpose()?
         .map(time::sleep)
         .map(Either::Left)
         .unwrap_or_else(|| Either::Right(future::pending::<()>()));
@@ -48,112 +63,134 @@ async fn main() -> Result<()> {
 
     let mut summary = opt.summary.then(Summary::default);
 
-    // Counter in env variable LOOP_COUNT
+    // Counter exposed via the $COUNT / $ACTUALCOUNT env vars.
     let mut iteration = 0u64;
 
-    // opt.stdin and opt.ffor
+    // --stdin and --for: source of $ITEM values.
     let mut items = if opt.stdin {
         let stdin = tokio::io::stdin();
         let lines = FramedRead::new(stdin, LinesCodec::new());
         let lines = lines.filter_map(|l| future::ready(l.ok()));
         Some(Either::Left(lines))
-    } else if let Some(ffor) = opt.ffor.as_ref() {
-        let iter = ffor.split(',').map(ToString::to_string);
+    } else if let Some(values) = opt.for_values.as_ref() {
+        let iter = values.split(',').map(ToString::to_string);
         Some(Either::Right(stream::iter(iter)))
     } else {
         None
     };
 
-    // opt.only_last
+    // --only-last: buffer of the final iteration's output.
     let mut output = opt.only_last.then(Vec::new);
 
-    // Cach last lines of stdout and stderr if needed
-    let mut last_stdout = None;
-    let mut last_stderr = None;
+    // Last seen line, needed for --until-same / --until-changes. With a single
+    // PTY stream we can no longer distinguish stdout from stderr.
+    let mut last_line = None;
+
+    let pty_system = native_pty_system();
 
     let exit = 'outer: loop {
-        let mut command = process::Command::new(SHELL[0]);
-        command.arg(SHELL[1]);
-        command.arg(&opt.input.join(" "));
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-
-        // opt.count_by
-        let count = opt.offset.unwrap_or_default() + iteration as f64 * opt.count_by;
-        command.env("COUNT", count.to_string());
-        command.env("ACTUALCOUNT", iteration.to_string());
-
-        // ffor and stdint
-        if let Some(items) = items.as_mut() {
-            if let Some(f) = items.next().await {
-                command.env("ITEM", f);
-            } else {
-                // Last item already used - exit...
-                break 0;
-            }
-        }
-
-        // spawn
-        let mut child = command.spawn()?;
-        let mut output_closed = false;
-        let mut running = true;
-
-        // opt.num
+        // --num: cap total iterations. Checked before spawning so we never
+        // start a process that we have no intention of running to completion.
         if let Some(n) = opt.num.as_mut() {
             if *n == 0 {
                 break 0;
-            } else {
-                *n -= 1;
+            }
+            *n -= 1;
+        }
+
+        let count = opt.offset.unwrap_or_default() + iteration as f64 * opt.count_by;
+        let mut builder = CommandBuilder::new(SHELL[0]);
+        builder.arg(SHELL[1]);
+        builder.arg(opt.input.join(" "));
+        // CommandBuilder doesn't inherit the parent's cwd or env; without this
+        // the child spawns in $HOME with an empty environment.
+        if let Ok(cwd) = std::env::current_dir() {
+            builder.cwd(cwd);
+        }
+        for (k, v) in std::env::vars_os() {
+            builder.env(k, v);
+        }
+        builder.env("COUNT", count.to_string());
+        builder.env("ACTUALCOUNT", iteration.to_string());
+
+        // Pull the next item from --for / --stdin, if any.
+        if let Some(items) = items.as_mut() {
+            match items.next().await {
+                Some(f) => builder.env("ITEM", f),
+                None => break 0,
             }
         }
 
-        // opt.only_last
+        let pair = pty_system
+            .openpty(DEFAULT_PTY_SIZE)
+            .context("failed to open pty")?;
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .context("failed to spawn command")?;
+        // Drop the parent's copy of the slave so EOF propagates on the master
+        // once the child exits.
+        drop(pair.slave);
+
+        let mut killer = child.clone_killer();
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .context("failed to clone pty reader")?;
+
+        // Drain the master in a blocking thread, forwarding lines through a
+        // channel. The PTY's line discipline appends \r before \n; strip both.
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+        let reader_task = task::spawn_blocking(move || {
+            let mut reader = BufReader::new(reader);
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match reader.read_line(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = buf.trim_end_matches(['\r', '\n']).to_string();
+                        if line_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // wait() is blocking; park it on the blocking pool and select on the
+        // resulting JoinHandle.
+        let mut child = child;
+        let mut wait_handle = task::spawn_blocking(move || child.wait());
+
+        let mut output_closed = false;
+        let mut running = true;
+
         if let Some(l) = output.as_mut() {
-            l.clear()
+            l.clear();
         }
 
-        // output streams
-        let stdout = child.stdout.take().context("failed to get stdout")?;
-        let stdout = FramedRead::new(stdout, LinesCodec::new()).map(Line::Stdout);
-
-        let stderr = child.stderr.take().expect("failed to get stderr");
-        let stderr = FramedRead::new(stderr, LinesCodec::new()).map(Line::Stderr);
-
-        // Stream containing stdout and stderr
-        let mut stdout_err = stream::select(stdout, stderr);
-
-        // Need to store the last stdout and stderr line
         let need_last = opt.until_same || opt.until_changes;
 
         'inner: loop {
             select! {
                 _ = &mut until => {
-                    child.kill().await.context("failed to terminate child process")?;
+                    if running {
+                        let _ = killer.kill();
+                    }
                     if opt.error_duration {
                         break 'outer TIMEOUT_EXIT_CODE;
                     } else {
                         break 'outer 0;
                     }
                 }
-                stdout_err = stdout_err.next() => {
-                    let (stdout_err, do_break) = match stdout_err {
-                        Some(output) => match output {
-                            Line::Stdout(Ok(ref l)) => {
-                                let last = need_last.then(|| last_stdout.replace(l.to_string())).flatten();
-                                let do_break = check_line(&opt, &l, last.as_ref());
-                                (output, do_break)
-                            },
-                            Line::Stderr(Ok(ref l)) => {
-                                let last = need_last.then(|| last_stderr.replace(l.to_string())).flatten();
-                                let do_break = check_line(&opt, &l, last.as_ref());
-                                (output, do_break)
-                            }
-                            Line::Stdout(e) | Line::Stderr(e) => return e.map(drop).context("io error"),
-                        }
+                line = line_rx.recv() => {
+                    let line = match line {
+                        Some(l) => l,
                         None => {
                             output_closed = true;
-                            // Just break if the child already exited. Otherwise set the flag
-                            // and the waitpid will do the rest.
+                            // Wait for the child to finish before exiting the inner loop.
                             if !running {
                                 break 'inner;
                             } else {
@@ -162,50 +199,54 @@ async fn main() -> Result<()> {
                         }
                     };
 
+                    let do_break = {
+                        let last = need_last
+                            .then(|| last_line.replace(line.clone()))
+                            .flatten();
+                        check_line(&opt, &line, last.as_deref())
+                    };
 
-                    // Print it
                     if let Some(output) = output.as_mut() {
-                        output.push(stdout_err);
+                        output.push(line);
                     } else {
-                        stdout_err.println();
+                        println!("{line}");
                     }
 
                     if do_break {
+                        if running {
+                            let _ = killer.kill();
+                        }
                         break 'outer 0;
                     }
                 }
-
-                exit = child.wait(), if running => {
+                wait_res = &mut wait_handle, if running => {
                     running = false;
 
-                    let exit_status = exit.context("failed to get process exist status")?;
-                    let exit_code = exit_status.code().context("failed to get exit code")?;
+                    let status = wait_res
+                        .context("wait task panicked")?
+                        .context("failed to wait for child")?;
+                    let exit_code = status.exit_code() as i32;
 
-                    // update summary
-                    if let Some(ref mut summary) = summary {
-                        if exit_status.success() {
+                    if let Some(summary) = summary.as_mut() {
+                        if status.success() {
                             summary.successes += 1;
                         } else {
                             summary.failures.push(exit_code);
                         }
                     }
 
-                    // opt.until_fail
-                    if opt.until_fail && !exit_status.success() {
+                    if opt.until_fail && !status.success() {
                         break 'outer exit_code;
                     }
 
-                    // opt.until_sucess
-                    if opt.until_success && exit_status.success() {
+                    if opt.until_success && status.success() {
                         break 'outer exit_code;
                     }
 
-                    // opt.until_error
                     if opt.until_code == Some(exit_code) {
                         break 'outer exit_code;
                     }
 
-                    // Break the inner loop if the reading stdout and stderr is complete
                     if output_closed {
                         break 'inner;
                     }
@@ -214,138 +255,138 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Join the reader thread before reusing per-iteration resources.
+        let _ = reader_task.await;
+        drop(pair.master);
+
         iteration += 1;
 
         if let Some(every) = opt.every {
             time::sleep(every).await;
         } else {
-            // Yield to the async runtime to avoid tight loop
+            // Yield to keep the runtime responsive in a tight loop.
             tokio::task::yield_now().await;
         }
     };
 
     if let Some(lines) = output {
         for line in lines {
-            line.println();
+            println!("{line}");
         }
     }
 
-    if let Some(_summary) = summary {
-        Summary::print(_summary)
+    if let Some(summary) = summary {
+        summary.print();
     }
 
     std::process::exit(exit);
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(
+#[derive(Parser, Debug)]
+#[command(
     name = "loop",
     author = "Rich Jones <miserlou@gmail.com>",
-    about = "UNIX's missing `loop` command"
+    version,
+    about = "UNIX's missing `loop` command",
+    trailing_var_arg = true
 )]
 struct Opt {
     /// Number of iterations to execute
-    #[structopt(short = "n", long = "num")]
+    #[arg(short = 'n', long = "num")]
     num: Option<u32>,
 
-    /// Amount to increment the counter by. Set $COUNT to the number of interations done
-    #[structopt(short = "b", long = "count-by", default_value = "1")]
+    /// Amount to increment the counter by. Sets $COUNT to the number of iterations done
+    #[arg(short = 'b', long = "count-by", default_value_t = 1.0)]
     count_by: f64,
 
     /// Amount to offset the initial counter by
-    #[structopt(short = "o", long = "offset")]
+    #[arg(short = 'o', long = "offset")]
     offset: Option<f64>,
 
     /// How often to iterate. ex., 5s, 1h1m1s1ms1us
-    #[structopt(short = "e", long = "every", parse(try_from_str = parse_duration))]
+    #[arg(short = 'e', long = "every", value_parser = parse_duration)]
     every: Option<Duration>,
 
     /// A comma-separated list of values, placed into $ITEM. ex., red,green,blue
-    #[structopt(long = "for", conflicts_with = "stdin")]
-    ffor: Option<String>,
+    #[arg(long = "for", conflicts_with = "stdin")]
+    for_values: Option<String>,
 
     /// Keep going until the duration has elapsed (example 1m30s)
-    #[structopt(short = "d", long = "for-duration", parse(try_from_str = parse_duration))]
+    #[arg(short = 'd', long = "for-duration", value_parser = parse_duration)]
     for_duration: Option<Duration>,
 
     /// Keep going until the output contains this string
-    #[structopt(short = "c", long = "until-contains")]
+    #[arg(short = 'c', long = "until-contains")]
     until_contains: Option<String>,
 
     /// Keep going until the output changes
-    #[structopt(short = "C", long = "until-changes")]
+    #[arg(short = 'C', long = "until-changes")]
     until_changes: bool,
 
-    /// Keep going until the output changes
-    #[structopt(short = "S", long = "until-same")]
+    /// Keep going until the output stays the same
+    #[arg(short = 'S', long = "until-same")]
     until_same: bool,
 
     /// Keep going until the output matches this regular expression
-    #[structopt(short = "m", long = "until-match", parse(try_from_str = Regex::new))]
+    #[arg(short = 'm', long = "until-match", value_parser = Regex::new)]
     until_match: Option<Regex>,
 
     /// Keep going until a future time, ex. "2018-04-20 04:20:00" (Times in UTC.)
-    #[structopt(short = "t", long = "until-time", parse(try_from_str = parse_rfc3339_weak))]
+    #[arg(short = 't', long = "until-time", value_parser = parse_rfc3339_weak)]
     until_time: Option<SystemTime>,
 
     /// Keep going until the command exit status is the value given
-    #[structopt(short = "r", long = "until-code")]
+    #[arg(short = 'r', long = "until-code")]
     until_code: Option<i32>,
 
     /// Keep going until the command exit status is zero
-    #[structopt(short = "s", long = "until-success")]
+    #[arg(short = 's', long = "until-success")]
     until_success: bool,
 
     /// Keep going until the command exit status is non-zero
-    #[structopt(short = "f", long = "until-fail")]
+    #[arg(short = 'f', long = "until-fail")]
     until_fail: bool,
 
     /// Only print the output of the last execution of the command
-    #[structopt(short = "l", long = "only-last")]
+    #[arg(short = 'l', long = "only-last")]
     only_last: bool,
 
     /// Read from standard input
-    #[structopt(short = "i", long = "stdin", conflicts_with = "for")]
+    #[arg(short = 'i', long = "stdin", conflicts_with = "for_values")]
     stdin: bool,
 
     /// Exit with timeout error code on duration
-    #[structopt(short = "D", long = "error-duration")]
+    #[arg(short = 'D', long = "error-duration")]
     error_duration: bool,
 
     /// Provide a summary
-    #[structopt(long = "summary")]
+    #[arg(long = "summary")]
     summary: bool,
 
     /// The command to be looped
+    #[arg(allow_hyphen_values = true)]
     input: Vec<String>,
 }
 
-/// Check a single line for a aborting condition. Return true if abortion condition is met.
-fn check_line(opt: &Opt, line: &str, last: Option<&String>) -> bool {
+/// Check a single line for an aborting condition. Returns true if it is met.
+fn check_line(opt: &Opt, line: &str, last: Option<&str>) -> bool {
     if let Some(last) = last {
-        if opt.until_changes && (last != line) {
+        if opt.until_changes && last != line {
             return true;
         }
-
-        if opt.until_same && (last == line) {
+        if opt.until_same && last == line {
             return true;
         }
     }
 
-    if opt
-        .until_match
-        .as_ref()
-        .map(|r| r.is_match(&line))
-        .unwrap_or(false)
-    {
+    if opt.until_match.as_ref().is_some_and(|r| r.is_match(line)) {
         return true;
     }
 
     if opt
         .until_contains
         .as_ref()
-        .map(|r| line.contains(r))
-        .unwrap_or(false)
+        .is_some_and(|s| line.contains(s))
     {
         return true;
     }
@@ -353,25 +394,6 @@ fn check_line(opt: &Opt, line: &str, last: Option<&String>) -> bool {
     false
 }
 
-/// Output result on stdout or stderr
-#[derive(Debug)]
-enum Line {
-    Stdout(Result<String, LinesCodecError>),
-    Stderr(Result<String, LinesCodecError>),
-}
-
-impl Line {
-    /// Print this line on stdout or stderr
-    fn println(&self) {
-        match self {
-            Line::Stdout(Ok(l)) => println!("{}", l),
-            Line::Stderr(Ok(l)) => eprintln!("{}", l),
-            _ => (),
-        }
-    }
-}
-
-/// Summary
 #[derive(Debug, Default)]
 struct Summary {
     successes: u32,
@@ -379,8 +401,7 @@ struct Summary {
 }
 
 impl Summary {
-    /// print summary
-    fn print(self) {
+    fn print(&self) {
         println!(
             "Total runs:\t{}",
             self.successes + self.failures.len() as u32

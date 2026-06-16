@@ -1,12 +1,15 @@
-extern crate assert_cmd;
 use assert_cmd::Command;
 
 fn test_stdout(args: Vec<&str>, expected_stdout: &'static str) {
+    test_stdout_code(args, expected_stdout, 0);
+}
+
+fn test_stdout_code(args: Vec<&str>, expected_stdout: &'static str, expected_code: i32) {
     Command::cargo_bin("loop")
         .unwrap()
         .args(args)
         .assert()
-        .success()
+        .code(expected_code)
         .stdout(expected_stdout);
 }
 
@@ -171,7 +174,7 @@ fn until_success() {
 
 #[test]
 fn until_fail() {
-    test_stdout(
+    test_stdout_code(
         vec![
             "--for=true,true,false,true",
             "--until-fail",
@@ -182,12 +185,13 @@ fn until_fail() {
         "Total runs:\t3\n\
          Successes:\t2\n\
          Failures:\t1 (1)\n",
+        1,
     );
 }
 
 #[test]
 fn until_error() {
-    test_stdout(
+    test_stdout_code(
         vec![
             "--for=true,true,false,true,true,true",
             "--until-fail",
@@ -198,5 +202,6 @@ fn until_error() {
         "Total runs:\t3\n\
          Successes:\t2\n\
          Failures:\t1 (1)\n",
+        1,
     );
 }
